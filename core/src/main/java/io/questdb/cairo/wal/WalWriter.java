@@ -149,9 +149,11 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     private int columnCount;
     private ColumnVersionReader columnVersionReader;
     private WalColumnarRowAppender columnarAppender;
+    private long columnarWriteStartRow;
     private ConversionSymbolMapWriter conversionSymbolMap;
     private ConversionSymbolTable conversionSymbolTable;
     private long currentTxnStartRowNum = -1;
+    private boolean hasOpenColumnarWrite;
     private boolean isCommittingData;
     private byte lastDedupMode = WAL_DEDUP_MODE_DEFAULT;
     private long lastMatViewPeriodHi = WAL_DEFAULT_LAST_PERIOD_HI;
@@ -324,6 +326,9 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     @Override
     public void beginColumnarWrite() {
         checkDistressed();
+        if (hasOpenColumnarWrite) {
+            throw CairoException.nonCritical().put("already in columnar write mode");
+        }
         try {
             if (rollSegmentOnNextRow) {
                 rollSegment();
@@ -333,6 +338,8 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
             distressed = true;
             throw e;
         }
+        columnarWriteStartRow = segmentRowCount;
+        hasOpenColumnarWrite = true;
     }
 
     @Override
@@ -634,7 +641,12 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
         }
         try {
             if (isInColumnarWrite()) {
-                columnarAppender.cancelColumnarWrite();
+                if (columnarAppender != null && columnarAppender.isInColumnarWrite()) {
+                    // the appender resets its own state and cancels through this writer
+                    columnarAppender.cancelColumnarWrite();
+                } else {
+                    cancelColumnarWrite(columnarWriteStartRow);
+                }
             }
             rollback0();
         } catch (Throwable th) {
@@ -1488,7 +1500,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     private boolean isInColumnarWrite() {
-        return columnarAppender != null && columnarAppender.isInColumnarWrite();
+        return hasOpenColumnarWrite;
     }
 
     private boolean isTruncateFilesOnClose() {
@@ -2133,6 +2145,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     @Override
     public void cancelColumnarWrite(long startRowId) {
         setAppendPosition(startRowId);
+        hasOpenColumnarWrite = false;
     }
 
     /**
@@ -2176,6 +2189,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
 
         // Update row count
         segmentRowCount += rowCount;
+        hasOpenColumnarWrite = false;
     }
 
     /**
