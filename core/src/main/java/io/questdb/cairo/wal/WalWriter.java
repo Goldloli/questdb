@@ -149,7 +149,6 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     private int columnCount;
     private ColumnVersionReader columnVersionReader;
     private WalColumnarRowAppender columnarAppender;
-    private long columnarWriteStartRow;
     private ConversionSymbolMapWriter conversionSymbolMap;
     private ConversionSymbolTable conversionSymbolTable;
     private long currentTxnStartRowNum = -1;
@@ -338,7 +337,6 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
             distressed = true;
             throw e;
         }
-        columnarWriteStartRow = segmentRowCount;
         hasOpenColumnarWrite = true;
     }
 
@@ -474,7 +472,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     /**
-     * Returns the data memory for a column. Used by columnar appender.
+     * Returns the data memory for a column, for columnar writes through {@link WalColumnSink}.
      */
     @Override
     public MemoryMA getDataColumn(int column) {
@@ -645,7 +643,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
                     // the appender resets its own state and cancels through this writer
                     columnarAppender.cancelColumnarWrite();
                 } else {
-                    cancelColumnarWrite(columnarWriteStartRow);
+                    cancelColumnarWrite();
                 }
             }
             rollback0();
@@ -702,8 +700,8 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     /**
-     * Marks a column as having been written up to the specified row.
-     * Used by columnar appender.
+     * Marks a column as having been written up to the specified row. Columnar writes
+     * through {@link WalColumnSink} call it after writing a column.
      */
     @Override
     public void setRowValueNotNullColumnar(int columnIndex, long lastWrittenRow) {
@@ -2143,8 +2141,11 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
      * Cancels a columnar write operation.
      */
     @Override
-    public void cancelColumnarWrite(long startRowId) {
-        setAppendPosition(startRowId);
+    public void cancelColumnarWrite() {
+        if (!hasOpenColumnarWrite) {
+            return;
+        }
+        setAppendPosition(segmentRowCount);
         hasOpenColumnarWrite = false;
     }
 
@@ -2153,6 +2154,9 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
      */
     @Override
     public void finishColumnarWrite(int rowCount, long minTimestamp, long maxTimestamp, boolean outOfOrder) {
+        if (!hasOpenColumnarWrite) {
+            throw CairoException.nonCritical().put("not in columnar write mode");
+        }
         // Fill in nulls for any columns that weren't written
         long lastExpectedRow = segmentRowCount + rowCount - 1;
         for (int i = 0; i < columnCount; i++) {
@@ -2193,7 +2197,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     /**
-     * Returns the aux memory for a column. Used by columnar appender.
+     * Returns the aux memory for a column, for columnar writes through {@link WalColumnSink}.
      */
     @Override
     public MemoryMA getAuxColumn(int column) {
