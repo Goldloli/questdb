@@ -266,6 +266,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
                     "custom event types must be in reserved range 64..127, got: " + txnType
             );
         }
+        throwIfInColumnarWrite("append custom event");
         try {
             // A custom event is an ordering barrier. Publish any rows appended before it as a
             // DATA transaction first; otherwise the custom event would receive the earlier
@@ -281,6 +282,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
 
     @Override
     public long apply(AlterOperation alterOp, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException {
+        throwIfInColumnarWrite("alter table");
         alterOp.authorize();
         if (alterOp.isStructural()) {
             return applyStructural(alterOp);
@@ -292,6 +294,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     // Returns table transaction number
     @Override
     public long apply(UpdateOperation operation) {
+        throwIfInColumnarWrite("update table");
         operation.authorize();
         if (inTransaction()) {
             throw CairoException.critical(0).put("cannot update table with uncommitted inserts [table=")
@@ -523,6 +526,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     public void goActive(long maxStructureVersion) {
+        throwIfInColumnarWrite("apply structure changes");
         try {
             applyMetadataChangeLog(maxStructureVersion);
         } catch (CairoException e) {
@@ -600,6 +604,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
             @Nullable LongList refreshIntervals,
             long refreshIntervalsBaseTxn
     ) {
+        throwIfInColumnarWrite("reset mat view state");
         try {
             lastSegmentTxn = events.appendMatViewInvalidate(
                     lastRefreshBaseTxn,
@@ -618,6 +623,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
     }
 
     public void rollSegment() {
+        throwIfInColumnarWrite("roll segment");
         try {
             openNewSegment();
         } catch (Throwable e) {
@@ -767,6 +773,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
      * rebased table parks instead of spinning.
      */
     public void commitRebaseSeed() {
+        throwIfInColumnarWrite("commit rebase seed");
         try {
             // Each appendData + getSequencerTxn pair is one sequencer transaction (segment_txn 0 and 1 ->
             // seqTxn 1 and 2). Both seeds are identical 0-row commits, so no per-txn state needs resetting
@@ -801,6 +808,7 @@ public class WalWriter extends WalWriterBase implements TableWriterAPI, WalColum
 
     @Override
     public void truncateSoft() {
+        throwIfInColumnarWrite("truncate table");
         try {
             lastSegmentTxn = events.truncate();
             getSequencerTxn();
