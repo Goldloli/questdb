@@ -53,10 +53,11 @@ public class O3ParquetMergeContext extends ParquetConversionContext {
     // The MERGE among the unchanged merge actions whose row groups hold NULLs of a column without NULL that may
     // be the rows of the column top that the output keeps, -1 when there is none, see setKeptTopMergeAction()
     private int keptTopMergeAction = -1;
-    // Decode buffers of the designated timestamp and the dedup key columns of a SKIP row group merge.
-    // They are apart from getRowGroupBuffers() because a parquet rewrite can copy row groups through
-    // ParquetRowGroupMaterializer, which decodes into the shared buffers, between the two stages of
-    // the merge. See O3PartitionJob.mergeRowGroupPrepare().
+    // Decode buffers of the designated timestamp and the dedup key columns of a key-only row group merge stage 1:
+    // a SKIP merge, the stage that computeColumnTopRowLimit() runs or the UPSERT identity check, see
+    // O3PartitionJob.mergeRowGroupPrepare(). They are apart from getRowGroupBuffers() because a parquet rewrite
+    // can copy row groups through ParquetRowGroupMaterializer, which decodes into the shared buffers, between the
+    // two stages of the merge.
     private RowGroupBuffers keyRowGroupBuffers;
     // The first stage of a row group merge hands the number of active columns, the active column
     // lists and the merge index, which this context owns, to the second stage. The lists are apart

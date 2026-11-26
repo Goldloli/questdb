@@ -200,9 +200,9 @@ symbol→fixed must decode as `VARCHAR_SLICE` (its reader expects the 16-byte sl
 
 ## Per-column source preparation (`ParquetColumnTypeConverter.prepareSourceColumn`)
 
-Runs **once per active column** of a row group that the merge writes. In SKIP mode, a merge whose O3
-rows the dedup all drops prepares only the designated timestamp and the dedup key columns. It turns
-the decoded row group into a target-typed *source* the merge/copy can consume, writing
+Runs **once per active column** of a row group that the merge writes. When stage 1 ran key-only, it
+prepares only the designated timestamp and the dedup key columns, and stage 2 prepares the rest. It
+turns the decoded row group into a target-typed *source* the merge/copy can consume, writing
 `outPtrs[slot4..+3] = {dataPtr, dataSize, auxPtr, auxSize}` and recording any buffer it
 allocates in the caller's free-list `ownedBufs[slot4..+3]` (`slot4 = ai*4`).
 
@@ -233,9 +233,9 @@ A `MERGE` runs in two stages, and `processParquetPartition()` sits between them:
 ```
 mergeRowGroupPrepare (stage 1)
   build decode list  -> chooseDecodeType per column, track timestamp chunk index
-                        (SKIP mode: the designated timestamp and the dedup keys only)
+                        (key-only stage 1: the designated timestamp and the dedup keys only)
   decode row group   -> Rust into RowGroupBuffers (worker-owned, freed when the partition task
-                        ends; SKIP mode: the context's separate keyRowGroupBuffers)
+                        ends; key-only stage 1: the context's separate keyRowGroupBuffers)
   Phase 1a           -> prepareSourceColumn per decoded column -> srcPtrs (+ nullBufs owns the
                         converted/null buffers).  RUNS BEFORE the dedup compare.
   merge index        -> replace: createReplaceMergeIndex (see Replace commits)
@@ -247,12 +247,31 @@ processParquetPartition
   UPSERT identity check found the MERGE identical -> the row groups stay as they are
   otherwise                      -> opens the output if it is not open yet (see Deduplication)
 mergeRowGroupWrite (stage 2)
-  SKIP mode          -> decode and Phase 1a for the columns that stage 1 left out
+  key-only stage 1   -> decode and Phase 1a for the columns that stage 1 left out
   even-split sizing  -> numChunks / maxChunkSize from (post-dedup) mergeRowCount
   Phase 1b           -> grow destination buffers in mergeDstBufs (reused across MERGE actions)
   Phase 2            -> O3CopyJob.mergeCopy into mergeDstBufs (allocates nothing) -> addRowGroup
 finally (caller)     -> O3ParquetMergeContext.freeRowGroupMerge(): nullBufs + merge index
 ```
+
+A **key-only stage 1** decodes the designated timestamp and the dedup key columns into
+`keyRowGroupBuffers`, and stage 2 decodes the rest. It is not a SKIP-mode construct: three callers
+run it.
+
+- the merge, where `isKeyColumnsOnly == isSkipMode`, so only a SKIP dedup commit;
+- `computeColumnTopRowLimit()`, for a commit of any dedup mode, and for a table without DEDUP: it
+  ends the prefix of rows that stay in place inside a row group, so it needs that row group's
+  stored timestamps, and it runs the stage with the dedup mode of the commit. It passes
+  `isKeyColumnsOnly = true` and keeps what it prepared, see
+  `O3ParquetMergeContext#keepRowGroupMerge`;
+- the UPSERT identity check, `isUpsertIdenticalUpToPartitionMax()`, which decodes the keys only and
+  dedups in UPSERT mode (`isKeyColumnsOnly = true`, `isSkipMode = false`). It runs only where the
+  output keeps a column top (`columnTopRowLimit != Long.MAX_VALUE`) on a table whose BOOLEAN, BYTE
+  or SHORT column has no NULL in the row group, `hasNoSentinelNull()`.
+
+A developer who reads stage 1 as a SKIP-only path can reuse or free `keyRowGroupBuffers` between the
+two stages of a merge that is not a SKIP one, and corrupt the merge. The buffers stay alive until
+the caller's `freeRowGroupMerge()`, in every mode.
 
 The critical ordering: **Phase 1a must precede the dedup compare.** The native dedup comparer
 reads the source pointers directly; if it saw the raw cross-typed decode buffer it would
@@ -380,7 +399,7 @@ size-0 removal. Neither writes a file.
 | Buffer | Holds | Lifetime | Freed |
 |---|---|---|---|
 | `RowGroupBuffers` | Rust decode output | per partition task, reused across its decodes | `releaseDecodeBuffers()` when the task ends; `getRowGroupBuffers()` reopens them |
-| `keyRowGroupBuffers` | SKIP stage-1 decode output (timestamp + dedup keys) | per partition task, reused across its decodes | `releaseDecodeBuffers()` when the task ends; `getKeyRowGroupBuffers()` reopens them |
+| `keyRowGroupBuffers` | key-only stage-1 decode output (timestamp + dedup keys) | per partition task, reused across its decodes | `releaseDecodeBuffers()` when the task ends; `getKeyRowGroupBuffers()` reopens them |
 | `rebaseAuxMem` (rebase arena, `O3ParquetMergeContext.getRebaseAuxMem()`) | aux vectors of var-size columns read from an offset-mapped WAL segment, rebased to their data window (`COPY_O3`, new parquet partition write) | per partition task; `populateO3DescriptorColumns()` sizes it once per call | `releaseDecodeBuffers()` when the task ends; the next `resize()` allocates it again |
 | `nullBufs` | **owned** conversion / null buffers (Phase 1a) | **per row group** | `O3ParquetMergeContext.freeRowGroupMerge()` in the caller's `finally` |
 | `tmpBufs` | owned conversion / null buffers (rewrite path) | per row group | rewrite `finally` |
@@ -414,12 +433,14 @@ with `freeNativePairs`; the pointer-copy lists (`srcPtrs`, `convertedPtrs`) are 
   Deduplication). `tableWriter.getColumnTop(partitionTs, ...)` is a partition-level value.
 - **One conversion site.** `chooseDecodeType` and `prepareSourceColumn` are
   shared by the merge and rewrite paths. Fix bugs in the helper, not in one caller.
-- **Merge state survives a materializer run.** In SKIP mode a rewrite can copy the row groups before
-  a `MERGE` through `ParquetRowGroupMaterializer` between the two stages of that merge. The
-  materializer decodes into the shared `ParquetConversionContext` scratch (`getRowGroupBuffers`,
-  the active-column lists, `convertedPtrs`, `tmpBufs`). So stage 1 keeps its state outside of it:
-  `keyRowGroupBuffers`, the merge's own active-column lists, `srcPtrs`, `nullBufs` and the merge
-  index. Stage 2 must not re-zero `nullBufs` or `srcPtrs`: it would drop the key columns' buffers.
+- **Merge state survives a materializer run.** When a stage 1 ran key-only — SKIP mode, or the key-only
+  stage that `computeColumnTopRowLimit()` runs into a row group whose prefix it ends in — a rewrite can
+  copy the row groups before a `MERGE` through `ParquetRowGroupMaterializer` between the two stages of
+  that merge. The materializer decodes into the shared `ParquetConversionContext` scratch
+  (`getRowGroupBuffers`, the active-column lists, `convertedPtrs`, `tmpBufs`). So stage 1 keeps its
+  state outside of it: `keyRowGroupBuffers`, the merge's own active-column lists, `srcPtrs`, `nullBufs`
+  and the merge index. Stage 2 must not re-zero `nullBufs` or `srcPtrs`: it would drop the key columns'
+  buffers.
 - **`var_data_len` is a debug-assert bound**, so a tight `getDataVectorSizeAt` extent is fine;
   do not pass a stale `getChunkDataSize` for a converted buffer.
 - **`dedup_column` is a packed struct.** Its `null_value` (read for rows in a column top) sits at

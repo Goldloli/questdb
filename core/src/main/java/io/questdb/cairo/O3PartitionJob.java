@@ -5647,9 +5647,11 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
      * reproduces the row group as it is when the dedup drops all of its O3 rows. To find this out without
      * reading the other columns, the first stage decodes only the designated timestamp and the dedup key columns
      * when {@code isKeyColumnsOnly}, into buffers of their own, and the second stage decodes the other columns.
-     * The merge passes {@code isKeyColumnsOnly == isSkipMode}; the UPSERT identity check, see
-     * {@link #isUpsertIdenticalUpToPartitionMax}, decodes the keys only and dedups in UPSERT mode, and may keep
-     * the merge for the merge loop to complete.
+     * The key-only first stage has three callers: the merge, which passes {@code isKeyColumnsOnly ==
+     * isSkipMode}; {@link #computeColumnTopRowLimit}, which runs it for a commit of any dedup mode when its
+     * prefix ends inside a row group; and the UPSERT identity check, see
+     * {@link #isUpsertIdenticalUpToPartitionMax}, which decodes the keys only and dedups in UPSERT mode. Each of
+     * them may keep the merge for the merge loop to complete.
      * <p>
      * A replace commit, {@code replaceLo <= replaceHi}, drops the existing rows inside its range, keeps the
      * rest and splices the O3 slice between them; replace and dedup never combine.
